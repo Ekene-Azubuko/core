@@ -4,7 +4,7 @@ import logging
 from datetime import timedelta
 
 from sqlalchemy import delete, select
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 from telegram.error import TelegramError
 
 from app.db.models import GeneratedProduct, Group, LoreProposal, new_id, now
@@ -14,7 +14,7 @@ log = logging.getLogger(__name__)
 
 INTRO = (
     "Core turns group-chat lore into physical products. With an admin's consent, "
-    "I store new text messages and send batches to OpenAI to find shared jokes. "
+    "I store new text messages. Mention me by @username to analyze recent messages for shared group lore. "
     "The group votes on real Arcade categories or No. Only a winning category starts "
     "generation; purchase is optional. Lore and its context are sent to Arcade after a win.\n\n"
     "Monitoring is off until an admin sends /resume. Use /pause to stop, /status for progress, "
@@ -56,7 +56,7 @@ async def resume(update, context):
     """Enable monitoring only after an administrator explicitly consents."""
     if await require_admin(update, context):
         await pipeline(context).set_monitoring(update.effective_chat.id, True)
-        await update.effective_message.reply_text("Monitoring enabled. New text messages will be stored and analyzed in batches.")
+        await update.effective_message.reply_text("Monitoring enabled. New text messages will be stored. Mention me by @username to analyze recent messages.")
 
 
 async def pause(update, context):
@@ -177,10 +177,23 @@ async def checkout(update, context, proposal_id):
         await update.effective_message.reply_text("Checkout could not be created. Tap Get yours again to retry.")
 
 
+def mentions_bot(message, bot):
+    """Recognize Telegram mention entities for this bot, including UTF-16 offsets."""
+    for entity in message.entities or ():
+        if entity.type == MessageEntity.MENTION:
+            if message.parse_entity(entity).casefold() == f"@{bot.username}".casefold():
+                return True
+        elif entity.type == MessageEntity.TEXT_MENTION and entity.user and entity.user.id == bot.id:
+            return True
+    return False
+
+
 async def message(update, context):
-    """Store ordinary group text; the background worker handles analysis separately."""
+    """Store ordinary text and request analysis only when it explicitly mentions Core."""
     if update.message:
-        await pipeline(context).store_message(update.message)
+        await pipeline(context).store_message(
+            update.message, analyze=mentions_bot(update.message, context.bot),
+        )
 
 
 async def membership(update, context):

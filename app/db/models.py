@@ -53,6 +53,12 @@ class Message(Base):
     window_id = Column(String, ForeignKey("analysis_windows.id", ondelete="CASCADE"), index=True)
 
 
+class WindowMessage(Base):
+    __tablename__ = "window_messages"
+    window_id = Column(String, ForeignKey("analysis_windows.id", ondelete="CASCADE"), primary_key=True)
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True)
+
+
 class LoreProposal(Base):
     __tablename__ = "lore_proposals"
     id = Column(String, primary_key=True, default=new_id)

@@ -14,7 +14,7 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 
 from app.bot import handlers
 from app.config import Config
-from app.db.models import AnalysisWindow, Base, GeneratedProduct, Group, LoreProposal, Message, Vote, now
+from app.db.models import AnalysisWindow, Base, GeneratedProduct, Group, LoreProposal, Message, Vote, WindowMessage, now
 from app.services.lore import Lore, LoreResult, extract_lore
 from app.services.pipeline import Pipeline
 from app.services.voting import cast_vote, outcome
@@ -30,6 +30,20 @@ PRODUCT = {"productId": "test-product", "unitPrice": {"amount": "48.00", "curren
 
 
 class VotingRules(unittest.TestCase):
+    def test_bot_mentions(self):
+        """Recognize only the bot's exact entity, including text following an emoji."""
+        from telegram import Chat, Message as TelegramMessage, MessageEntity, User
+        bot = SimpleNamespace(username="CoreBot", id=99)
+        for text, entities, expected in [
+            ("👀 @cOrEbOt", [MessageEntity("mention", 3, 8)], True),
+            ("@OtherBot", [MessageEntity("mention", 0, 9)], False),
+            ("@CoreBotExtra", [MessageEntity("mention", 0, 13)], False),
+            ("@CoreBot", [], False),
+        ]:
+            message = TelegramMessage(1, now(), Chat(-100, "supergroup"),
+                                      from_user=User(1, "User", False), text=text, entities=entities)
+            self.assertEqual(handlers.mentions_bot(message, bot), expected)
+
     def test_outcomes(self):
         """Check plurality, No ties, runoffs and empty votes."""
         cases = [([], ("expired", [])), ([-1, -1, 0], ("rejected", [-1])),
@@ -90,7 +104,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
     async def proposal(self):
         """Drive message storage through structured extraction into a published vote."""
         await self.core.store_message(self.message(1))
-        await self.core.store_message(self.message(2))
+        await self.core.store_message(self.message(2), analyze=True)
         window_id = await self.core.claim_window(-100)
         await self.core.analyze_window(window_id)
         async with self.sessions() as session:
@@ -124,11 +138,11 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.reply_to_message_id, 1)
             self.assertEqual(message.sender_name, "Test member")
 
-    async def test_threshold_and_duplicate_claims(self):
-        """Concurrent triggers claim exactly one window without reusing messages."""
+    async def test_mentions_and_duplicate_claims(self):
+        """A mention creates one durable window shared by concurrent worker checks."""
         await self.core.store_message(self.message(1))
         self.assertIsNone(await self.core.claim_window(-100))
-        await self.core.store_message(self.message(2))
+        await self.core.store_message(self.message(2), analyze=True)
         claims = await asyncio.gather(self.core.claim_window(-100), self.core.claim_window(-100))
         self.assertEqual(claims[0], claims[1])
         self.assertEqual(await self.count(AnalysisWindow), 1)
@@ -137,12 +151,41 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         """A no-lore response consumes its window without retrieving Arcade categories."""
         self.openai.responses.parse.return_value = SimpleNamespace(output_parsed=LoreResult(lore=None))
         await self.core.store_message(self.message(1))
-        await self.core.store_message(self.message(2))
+        await self.core.store_message(self.message(2), analyze=True)
         await self.core.analyze_window(await self.core.claim_window(-100))
         async with self.sessions() as session:
             self.assertEqual((await session.scalar(select(AnalysisWindow))).status, "analyzed")
         self.assertEqual(await self.count(LoreProposal), 0)
         self.arcade.categories.assert_not_awaited()
+
+    async def test_messages_alone_never_trigger(self):
+        """Exceeding the context limit stores messages without requesting any analysis."""
+        for number in range(1, 6):
+            await self.core.store_message(self.message(number))
+        await self.core.process_chat(-100)
+        self.assertEqual(await self.count(Message), 5)
+        self.assertEqual(await self.count(AnalysisWindow), 0)
+        self.openai.responses.parse.assert_not_awaited()
+
+    async def test_short_fixed_snapshots_and_duplicate_mentions(self):
+        """Mentions use latest context, preserve old snapshots, and deduplicate updates."""
+        self.openai.responses.parse.return_value = SimpleNamespace(output_parsed=LoreResult(lore=None))
+        await self.core.store_message(self.message(1), analyze=True)
+        first = await self.core.claim_window(-100)
+        await self.core.analyze_window(first)
+        await self.core.store_message(self.message(2))
+        await self.core.store_message(self.message(3), analyze=True)
+        second = await self.core.claim_window(-100)
+        await self.core.store_message(self.message(4))
+        await self.core.analyze_window(second)
+        import json
+        sent = json.loads(self.openai.responses.parse.call_args.kwargs['input'][1]['content'])
+        self.assertEqual([m['message_id'] for m in sent['messages']], [2, 3])
+        self.assertFalse(await self.core.store_message(self.message(3), analyze=True))
+        self.assertEqual(await self.count(AnalysisWindow), 2)
+        async with self.sessions() as session:
+            self.assertEqual(len(list(await session.scalars(select(WindowMessage).where(
+                WindowMessage.window_id == first)))), 1)
 
     async def test_proposal_creation(self):
         """A grounded result produces actual supplied categories plus a timed vote."""
@@ -262,7 +305,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_window_can_retry(self):
         """A failed extraction retains its messages and needs an explicit retry."""
         await self.core.store_message(self.message(1))
-        await self.core.store_message(self.message(2))
+        await self.core.store_message(self.message(2), analyze=True)
         window = await self.core.claim_window(-100)
         self.openai.responses.parse.side_effect = TimeoutError()
         await self.core.analyze_window(window)
@@ -325,7 +368,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         self.openai.responses.parse.side_effect = slow_response
         await self.core.store_message(self.message(1))
-        await self.core.store_message(self.message(2))
+        await self.core.store_message(self.message(2), analyze=True)
         task = asyncio.create_task(self.core.process_chat(-100))
         self.core.tasks[-100] = task
         await asyncio.wait_for(entered.wait(), 2)

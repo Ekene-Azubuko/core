@@ -2,7 +2,7 @@
 
 Core turns shared Telegram group jokes into physical products:
 
-**Consent → text messages → GPT lore → category/No vote → Arcade product → private checkout.**
+**Consent → stored text → @mention → GPT lore → category/No vote → Arcade product → private checkout.**
 
 The application is implemented and verified with PostgreSQL and mocked external
 services. A live demo still requires your Telegram, OpenAI and Arcade credentials.
@@ -19,12 +19,27 @@ pip install -r requirements.txt
 cp env.example .env
 ```
 
-Create a PostgreSQL database locally or with a hosted provider. With a running
-local PostgreSQL installation, use `createdb core`. Set `DATABASE_URL` to your
-connection URL, such as `postgresql://YOUR_USER:YOUR_PASSWORD@YOUR_HOST:5432/core`.
-Core converts this to the asyncpg format. Tables are created at startup; the
-database must already exist. Use a direct or session-pooled connection, not a
-transaction-pooled connection: the worker uses a session advisory lock.
+For local storage, start Docker Desktop and set `POSTGRES_USER=core`,
+`POSTGRES_DB=core` and your chosen `POSTGRES_PASSWORD` in `.env`. Set
+`DATABASE_URL=postgresql+asyncpg://core:YOUR_PASSWORD@127.0.0.1:5433/core`
+(URL-encode special characters in the URL password). Then run:
+
+```sh
+docker compose up -d --wait
+docker compose ps
+```
+
+PostgreSQL 17 stores data in `.data/postgres/` inside the project root via a bind
+mount. This directory is gitignored and survives container recreation. Only
+localhost port 5433 is exposed. Use `docker compose stop` to stop it and
+`docker compose up -d --wait` to start it again. Do not delete `.data/postgres/`
+unless you intend to erase the database. Changing initialization variables after
+the first start does not change existing database credentials.
+
+The old native `.postgres/` directory, if present, is separate and is not
+automatically migrated. Tables are created when Core starts. Hosted PostgreSQL
+also works; use a direct/session-pooled connection, not transaction pooling,
+because Core uses a session advisory lock.
 
 Fill `.env` locally; never commit it. `env.example` contains blank placeholders only.
 
@@ -34,10 +49,13 @@ Fill `.env` locally; never commit it. `env.example` contains blank placeholders 
 | `OPENAI_API_KEY` | Required; OpenAI project key |
 | `ARCADE_API_KEY` | Required; Arcade physical-product API key |
 | `DATABASE_URL` | Required; PostgreSQL connection URL |
+| `POSTGRES_USER` | Docker database user; default `core` |
+| `POSTGRES_DB` | Docker database name; default `core` |
+| `POSTGRES_PASSWORD` | Required for Docker initialization; match the URL password |
 | `ARCADE_USER_AGENT` | Required; integration name/contact, e.g. `Core/0.1 (YOUR_CONTACT)` |
-| `OPENAI_MODEL` | Structured-output-capable model; default `gpt-4o-mini` |
+| `OPENAI_MODEL` | Structured-output-capable model; default `gpt-5.6-luna` |
 | `ARCADE_BASE_URL` | Default `https://platform.arcade.ai/v1` |
-| `LORE_WINDOW_SIZE` | Default `100`; use `10` for demos |
+| `LORE_WINDOW_SIZE` | Maximum recent messages per mention; default `100` |
 | `VOTE_DURATION_SECONDS` | Default `120`; use `30` for demos |
 | `ARCADE_POLL_SECONDS` | Default `5` |
 | `ARCADE_JOB_TIMEOUT_SECONDS` | Default `600`; retry resumes the same job |
@@ -88,8 +106,10 @@ not Telegram history or provider-side data/products, and leaves monitoring off.
 ## Flow and architecture
 
 1. PostgreSQL deduplicates messages by `(chat_id, telegram_message_id)`.
-2. A worker checks every two seconds and atomically claims exactly X oldest
-   unclaimed messages. Per-group locks stay short; slow APIs do not block ingestion.
+2. Text is stored continuously while monitoring. An explicit @mention snapshots
+   up to `LORE_WINDOW_SIZE` latest messages, including the mention, even if fewer
+   are available. The background worker processes saved requests every two seconds.
+   Ordinary messages never trigger analysis. Per-group locks stay short; slow APIs do not block ingestion.
    One task runs per group; a database advisory lock prevents a second worker.
 3. OpenAI Responses structured output supplies grounded lore or null. Evidence IDs
    must be in the window. The latest 20 proposals discourage repetitive suggestions.
@@ -126,7 +146,7 @@ checkout. The actual product selection is shown; user-chosen variants are not im
 | `app/services/lore.py` | OpenAI schema, prompt and evidence validation |
 | `app/services/arcade.py` | Arcade HTTP API, categories, jobs, prices and checkout |
 | `app/services/voting.py` | Vote upserts, counting and runoffs |
-| `app/db/models.py` | Six SQLAlchemy models and cascading deletion |
+| `app/db/models.py` | Seven SQLAlchemy models and cascading deletion |
 | `app/db/session.py` | Async PostgreSQL sessions and table creation |
 | `tests/` | Standard-library tests with mocked external services |
 | `summary.md` | Current implementation and known limitations |
@@ -157,10 +177,11 @@ Manual demo after configuring real credentials:
 
 1. Set window size to 10 and vote duration to 30, then restart Core.
 2. Verify messages before `/resume` do not increase `/status` counts.
-3. Enable monitoring; have two members establish a shared joke across 10 messages.
+3. Enable monitoring; have members chat, then @mention the bot. Confirm ordinary
+   messages alone never trigger analysis and a mention works with fewer than 10.
 4. Confirm grounded lore and actual category buttons appear. Vote No and verify
    no generation. Exercise a No tie and category runoff.
-5. Establish new lore in another window and choose a category. Wait for the real
+5. Establish new lore, @mention Core again, and choose a category. Wait for the real
    image/price. Open Get yours from two accounts and verify separate private checkouts.
 6. Pause/resume and restart during a job; confirm saved work resumes.
 7. Confirm `/delete_data` clears the group and turns monitoring off.
@@ -193,3 +214,14 @@ Checked October 11, 2026:
 - [Arcade OpenAPI schema](https://docs.arcade.ai/openapi.json)
 - [Arcade idempotency](https://docs.arcade.ai/idempotency)
 - [Arcade checkout API](https://docs.arcade.ai/api-reference/checkouts/create-a-checkout)
+
+### Mention-triggered windows
+
+Only explicit Telegram mentions of this bot trigger a new window; mentioning another
+user, a plain reply, or editing an older message does not. Commands remain excluded
+from message collection. Previous messages may appear in multiple windows, and recent
+lore history still discourages repetition. Each window is fixed at mention time.
+Mentions while analysis is pending or failed do not queue additional windows; failed
+analysis requires an admin `/retry`. Previously saved work still resumes after restart.
+The new `window_messages` table is created automatically on startup; existing data
+and legacy window associations are preserved. Restart the bot to activate this change.

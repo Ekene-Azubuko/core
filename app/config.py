@@ -21,7 +21,7 @@ class Config:
     arcade_key: str
     database_url: str
     arcade_user_agent: str
-    openai_model: str = "gpt-4o-mini"
+    openai_model: str = "gpt-5.6-luna"
     arcade_base_url: str = "https://platform.arcade.ai/v1"
     window_size: int = 100
     vote_seconds: int = 120
@@ -46,7 +46,7 @@ def load_config():
     return Config(
         os.environ["TELEGRAM_BOT_TOKEN"], os.environ["OPENAI_API_KEY"],
         os.environ["ARCADE_API_KEY"], url, os.environ["ARCADE_USER_AGENT"],
-        os.getenv("OPENAI_MODEL") or "gpt-4o-mini",
+        os.getenv("OPENAI_MODEL") or "gpt-5.6-luna",
         os.getenv("ARCADE_BASE_URL") or "https://platform.arcade.ai/v1",
         positive_int("LORE_WINDOW_SIZE", 100),
         positive_int("VOTE_DURATION_SECONDS", 120),

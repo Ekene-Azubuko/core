@@ -2,7 +2,7 @@
 
 ## Current pipeline
 
-Implemented: admin consent → Telegram text → PostgreSQL storage → configurable
+Implemented: admin consent → Telegram text → PostgreSQL storage → @mention → latest-message
 window → GPT structured lore → actual Arcade categories plus No → persisted inline
 votes → approved Arcade generation → real image/unit price → private buyer checkout.
 Live end-to-end verification awaits credentials. Verification uses real PostgreSQL
@@ -13,11 +13,15 @@ Monitoring defaults off. `/start` explains; only an admin can `/resume`, `/pause
 stored. Commands, edits, bots and queued messages predating consent are excluded.
 
 A worker scans every two seconds with one task per group. Short locks serialize
-storage, window claims and votes; slow external calls do not hold them. A PostgreSQL
+storage, window requests and votes; slow external calls do not hold them. A PostgreSQL
 session advisory lock prevents a second worker. Use one poller and a direct or
 session-pooled database connection.
 
-Exactly X messages are assigned to a chronological window. GPT receives speaker,
+An explicit Telegram @mention snapshots up to LORE_WINDOW_SIZE latest stored
+messages, including the mentioning message, even when fewer are available. Ordinary
+messages never start analysis. Windows can overlap and remain fixed for retries.
+Mentions while analysis is pending/failed are coalesced; /retry handles failures.
+Previously saved work still resumes after restart. GPT receives speaker,
 timestamp, text, message/reply IDs and the latest 20 proposals. Structured output
 must cite IDs inside the window. Null consumes a window without a proposal. Failed
 windows retain messages and block later windows until an admin retries.
@@ -39,6 +43,8 @@ dropShip=true. No payments are submitted by Core.
 ## Important files
 
 - `app/main.py`: polling, lifecycle, handler registration and single-worker lock.
+  Logs "Core bot is now running" with the bot username once both the application
+  and Telegram polling have started; failed startup does not print readiness.
 - `app/config.py`: environment configuration and positive integer validation.
 - `app/bot/handlers.py`: consent, admin controls, ingestion, callbacks, private checkout.
 - `app/bot/keyboards.py`: round-specific voting, retries and purchase deep links.
@@ -48,7 +54,7 @@ dropShip=true. No payments are submitted by Core.
 - `app/services/arcade.py`: documented HTTP integration, transient retries, categories,
   generation, jobs, product quotes and checkout.
 - `app/services/voting.py`: atomic vote upserts, counting and runoffs.
-- `app/db/models.py`: six SQLAlchemy models and UTC timestamp helpers.
+- `app/db/models.py`: seven SQLAlchemy models and UTC timestamp helpers.
 - `app/db/session.py`: asyncpg engine, SQLAlchemy sessions and table creation.
 - `tests/test_core.py`: PostgreSQL workflow tests with external services mocked.
 - `tests/test_arcade.py`: Arcade HTTP contract tests with a mock transport.
@@ -59,9 +65,18 @@ dropShip=true. No payments are submitted by Core.
 
 Startup creates missing tables; there are no schema migrations.
 
+Local PostgreSQL now runs in Docker using `compose.yaml` (PostgreSQL 17), bound
+to `127.0.0.1:5433`. Its persistent bind mount is `.data/postgres/` in the project
+root, excluded from Git. Start with `docker compose up -d --wait`; stop with
+`docker compose stop`. The native PostgreSQL server was stopped; its `.postgres/`
+directory remains intact. Existing native data was not migrated because the
+backup command was denied. The container initialized a separate database.
+
 - `groups`: Telegram chat ID; paused/monitoring; consent time; expiring deletion token.
 - `messages`: group ID, Telegram message ID, sender ID/name, text, timestamp, reply ID,
-  window ID. Unique `(chat_id, telegram_message_id)`. Null window means collecting.
+  window ID. Unique `(chat_id, telegram_message_id)`. The window ID is retained only for legacy windows.
+- `window_messages`: window/message association with a composite primary key; allows
+  overlapping snapshots without reassigning old messages. Created automatically at startup.
 - `analysis_windows`: group ID, analyzing/analyzed/failed, saved lore, sanitized error.
 - `lore_proposals`: group/window, lore, categories, round/deadline, Telegram post,
   winner, exact generation request, job ID, error and notification flag. Statuses:
@@ -91,24 +106,27 @@ leaves monitoring off. Payment data and checkout URLs are not stored locally.
 Required: TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, ARCADE_API_KEY, DATABASE_URL,
 ARCADE_USER_AGENT (integration name/contact).
 
-Optional: OPENAI_MODEL (gpt-4o-mini), ARCADE_BASE_URL (https://platform.arcade.ai/v1),
+Optional: OPENAI_MODEL (gpt-5.6-luna), ARCADE_BASE_URL (https://platform.arcade.ai/v1),
 LORE_WINDOW_SIZE (100), VOTE_DURATION_SECONDS (120), ARCADE_POLL_SECONDS (5),
 ARCADE_JOB_TIMEOUT_SECONDS (600). Blank optional values use defaults.
 TEST_DATABASE_URL is test-only and enables the full PostgreSQL suite.
+Docker additionally uses POSTGRES_USER and POSTGRES_DB (both default to core),
+and requires POSTGRES_PASSWORD. The local .env connection URL was updated to
+match; credentials remain private. Initialization settings only apply to empty storage.
 
 ## Current state
 
 **Working (implemented and verified with mocked external services)**
 
-- Consent, isolated/deduplicated storage, window thresholds, structured lore/no-lore.
+- Consent, isolated/deduplicated storage, mention-triggered recent windows, structured lore/no-lore.
 - Real API category client, persisted proposals, changed votes, No ties, runoffs, expiry.
 - Vote-gated generation, idempotent requests, saved jobs, retries/restart recovery.
 - Real-price/image retrieval, result posts and private per-buyer checkouts.
 - Pause/removal controls, confirmed cascading deletion and sanitized error logs.
-- Full suite: 30 tests passed against isolated local PostgreSQL, including in-flight
+- Full suite: 33 tests passed using isolated schemas in Docker PostgreSQL, including in-flight
   pause cancellation, admin consent, cross-group callbacks and private checkout access.
 - Dependency consistency, syntax compilation, function docstrings and secret-pattern
-  checks passed. No real .env was created and no credentials were added.
+  checks passed. Local configuration stays in the gitignored .env.
 
 **In progress**
 
@@ -134,3 +152,8 @@ TEST_DATABASE_URL is test-only and enables the full PostgreSQL suite.
 - Repeated category ties mean more runoffs, never an invented winner.
 - Reliable Telegram membership checks need the bot to be a group administrator.
 - Checkout may add shipping, drop-ship fees and tax to the displayed unit price.
+
+LORE_WINDOW_SIZE now sets the maximum context size per mention, not a trigger threshold.
+Mention detection uses Telegram entities and UTF-16-aware parsing. Commands, edits,
+plain replies and mentions of other users do not trigger analysis. No existing records
+need to be rewritten; legacy windows still load through messages.window_id.

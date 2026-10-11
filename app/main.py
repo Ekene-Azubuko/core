@@ -1,5 +1,6 @@
 """Run one Telegram polling process and its lightweight background worker."""
 
+import asyncio
 import logging
 
 from openai import AsyncOpenAI
@@ -12,6 +13,15 @@ from app.config import load_config
 from app.db.session import connect_database, create_tables
 from app.services.arcade import Arcade
 from app.services.pipeline import Pipeline
+
+log = logging.getLogger(__name__)
+
+
+async def announce_running(application):
+    """Log readiness after polling and application startup have completed."""
+    while not application.running or not application.updater.running:
+        await asyncio.sleep(0.1)
+    log.info("Core bot is now running as @%s. Press Ctrl+C to stop.", application.bot.username)
 
 
 async def startup(application):
@@ -32,6 +42,7 @@ async def startup(application):
     core = Pipeline(config, sessions, application.bot, openai, arcade)
     application.bot_data["pipeline"] = core
     await core.start()
+    application.bot_data["startup_notice"] = asyncio.create_task(announce_running(application))
 
 
 async def stop(application):
@@ -43,6 +54,10 @@ async def stop(application):
 
 async def shutdown(application):
     """Close external clients, release the worker lock and dispose database connections."""
+    notice = application.bot_data.get("startup_notice")
+    if notice:
+        notice.cancel()
+        await asyncio.gather(notice, return_exceptions=True)
     core = application.bot_data.get("pipeline")
     if core:
         await core.openai.close()

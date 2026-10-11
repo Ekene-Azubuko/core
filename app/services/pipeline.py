@@ -10,7 +10,7 @@ from sqlalchemy.dialects.postgresql import insert
 from telegram.error import BadRequest, Forbidden, TelegramError
 
 from app.bot.keyboards import buy_keyboard, retry_keyboard, voting_keyboard
-from app.db.models import AnalysisWindow, GeneratedProduct, Group, LoreProposal, Message, new_id, now
+from app.db.models import AnalysisWindow, GeneratedProduct, Group, LoreProposal, Message, WindowMessage, new_id, now
 from app.services.arcade import JobFailed
 from app.services.lore import extract_lore
 from app.services.voting import close_vote
@@ -27,8 +27,8 @@ class Pipeline:
         self.tasks = {}
         self.worker = None
 
-    async def store_message(self, message):
-        """Deduplicate and store text only after group consent and outside pauses."""
+    async def store_message(self, message, analyze=False):
+        """Store consented text and atomically snapshot recent messages on a mention."""
         if not message.from_user or message.from_user.is_bot or not message.text:
             return False
         async with self.locks[message.chat_id], self.sessions.begin() as session:
@@ -44,6 +44,8 @@ class Pipeline:
                                      if message.reply_to_message else None),
             ).on_conflict_do_nothing(index_elements=[Message.chat_id, Message.telegram_message_id])
             result = await session.execute(statement)
+            if result.rowcount == 1 and analyze:
+                await self.request_window(session, message.chat_id)
             return result.rowcount == 1
 
     async def set_monitoring(self, chat_id, enabled):
@@ -120,29 +122,36 @@ class Pipeline:
             log.error("Group work failed (%s): %s", chat_id, type(error).__name__)
             await asyncio.sleep(5)
 
+    async def request_window(self, session, chat_id):
+        """Snapshot up to the latest N messages; coalesce mentions while work is pending."""
+        existing = await session.scalar(select(AnalysisWindow.id).where(
+            AnalysisWindow.chat_id == chat_id,
+            AnalysisWindow.status.in_(["analyzing", "failed"]),
+        ).limit(1))
+        if existing:
+            return
+        messages = list(await session.scalars(select(Message).where(
+            Message.chat_id == chat_id,
+        ).order_by(Message.timestamp.desc(), Message.telegram_message_id.desc())
+          .limit(self.config.window_size)))
+        if not messages:
+            return
+        window = AnalysisWindow(chat_id=chat_id)
+        session.add(window)
+        await session.flush()
+        # Separate membership rows preserve overlapping windows and exact retry context.
+        for message in messages:
+            session.add(WindowMessage(window_id=window.id, message_id=message.id))
+
     async def claim_window(self, chat_id):
-        """Atomically assign the oldest X unclaimed messages to one durable window."""
-        async with self.locks[chat_id], self.sessions.begin() as session:
+        """Find previously requested work without triggering analysis from message counts."""
+        async with self.locks[chat_id], self.sessions() as session:
             group = await session.get(Group, chat_id)
             if not group or group.status != "monitoring":
                 return None
-            existing = await session.scalar(select(AnalysisWindow).where(
-                AnalysisWindow.chat_id == chat_id,
-                AnalysisWindow.status.in_(["analyzing", "failed"]),
+            return await session.scalar(select(AnalysisWindow.id).where(
+                AnalysisWindow.chat_id == chat_id, AnalysisWindow.status == "analyzing",
             ).order_by(AnalysisWindow.created_at).limit(1))
-            if existing:
-                return existing.id if existing.status == "analyzing" else None
-            messages = list(await session.scalars(select(Message).where(
-                Message.chat_id == chat_id, Message.window_id.is_(None),
-            ).order_by(Message.timestamp, Message.telegram_message_id).limit(self.config.window_size)))
-            if len(messages) < self.config.window_size:
-                return None
-            window = AnalysisWindow(chat_id=chat_id)
-            session.add(window)
-            await session.flush()
-            for message in messages:
-                message.window_id = window.id
-            return window.id
 
     async def analyze_window(self, window_id):
         """Persist grounded lore before retrieving categories and creating its vote."""
@@ -151,8 +160,13 @@ class Pipeline:
             if window is None:
                 return
             chat_id, lore = window.chat_id, window.lore
+            message_ids = list(await session.scalars(select(WindowMessage.message_id).where(
+                WindowMessage.window_id == window_id,
+            )))
+            # Older windows retain their original Message.window_id association.
+            condition = Message.id.in_(message_ids) if message_ids else Message.window_id == window_id
             messages = list(await session.scalars(select(Message).where(
-                Message.window_id == window_id,
+                Message.chat_id == chat_id, condition,
             ).order_by(Message.timestamp, Message.telegram_message_id)))
             recent = list(await session.scalars(select(LoreProposal.lore).where(
                 LoreProposal.chat_id == chat_id,
@@ -355,12 +369,13 @@ class Pipeline:
         async with self.sessions() as session:
             group = await session.get(Group, chat_id)
             count = await session.scalar(select(func.count()).select_from(Message).where(
-                Message.chat_id == chat_id, Message.window_id.is_(None),
+                Message.chat_id == chat_id,
             ))
             windows = list(await session.scalars(select(AnalysisWindow.status).where(AnalysisWindow.chat_id == chat_id)))
             proposals = list(await session.scalars(select(LoreProposal.status).where(LoreProposal.chat_id == chat_id)))
         return (f"Monitoring: {group.status if group else 'paused'}\n"
-                f"Unclaimed messages: {count}/{self.config.window_size}\n"
+                f"Stored messages: {count}\n"
+                f"Mention @{self.bot.username} to analyze up to {self.config.window_size} recent messages.\n"
                 f"Analyzing windows: {windows.count('analyzing')}\n"
                 f"Failed windows: {windows.count('failed')}\n"
                 f"Open votes: {proposals.count('voting')}\n"
