@@ -26,8 +26,13 @@ timestamp, text, message/reply IDs and the latest 20 proposals. Structured outpu
 must cite IDs inside the window. Null consumes a window without a proposal. Failed
 windows retain messages and block later windows until an admin retries.
 
-Arcade supplies categories dynamically. Core picks up to three distinct category
-groups, preferring print and sorting alphabetically. One vote per member/round can
+Core preloads the full supported Arcade catalog at startup and refreshes it on use
+after one hour. GPT selects one to three real category IDs using the detected lore
+and the latest saved message (the mention request), with the best match first.
+An explicit product request takes priority; a clear single match can yield one
+category plus No. Open-ended requests get relevant alternatives without a print
+or alphabetical default. Unknown or duplicate model-selected IDs fail safely.
+If catalog preload fails, the bot starts and retries retrieval during analysis. One vote per member/round can
 change until the deadline. Highest count wins; No wins ties; category ties create
 a fresh runoff with tied categories and No; zero votes expire. Old-round votes do
 not count in a new round.
@@ -50,7 +55,7 @@ dropShip=true. No payments are submitted by Core.
 - `app/bot/keyboards.py`: round-specific voting, retries and purchase deep links.
 - `app/services/pipeline.py`: collection, window/proposal transitions, workers, retries,
   product generation/delivery, pause and recovery.
-- `app/services/lore.py`: structured OpenAI output, grounded prompt, evidence validation.
+- `app/services/lore.py`: structured lore extraction and validated GPT selection from the full Arcade catalog.
 - `app/services/arcade.py`: documented HTTP integration, transient retries, categories,
   generation, jobs, product quotes and checkout.
 - `app/services/voting.py`: atomic vote upserts, counting and runoffs.
@@ -58,6 +63,7 @@ dropShip=true. No payments are submitted by Core.
 - `app/db/session.py`: asyncpg engine, SQLAlchemy sessions and table creation.
 - `tests/test_core.py`: PostgreSQL workflow tests with external services mocked.
 - `tests/test_arcade.py`: Arcade HTTP contract tests with a mock transport.
+- `tests/test_category_selection.py`: full-catalog GPT input and rejection of invented/duplicate IDs.
 - `README.md`: setup, BotFather, variables, workflow, tests and manual demo.
 - `env.example`: placeholders only; real `.env` is gitignored.
 
@@ -65,12 +71,12 @@ dropShip=true. No payments are submitted by Core.
 
 Startup creates missing tables; there are no schema migrations.
 
-Local PostgreSQL now runs in Docker using `compose.yaml` (PostgreSQL 17), bound
-to `127.0.0.1:5433`. Its persistent bind mount is `.data/postgres/` in the project
-root, excluded from Git. Start with `docker compose up -d --wait`; stop with
-`docker compose stop`. The native PostgreSQL server was stopped; its `.postgres/`
-directory remains intact. Existing native data was not migrated because the
-backup command was denied. The container initialized a separate database.
+The configured database is now Supabase PostgreSQL through its session pooler on
+port 5432. DATABASE_URL lives only in .env and explicitly requires TLS. All seven
+Core tables were initialized without migrating local data. The Docker database
+container is stopped; .data/postgres/ and the older .postgres/ directory remain
+untouched. compose.yaml remains available for optional local development.
+Restart Core to load the new URL; groups must /resume again on this fresh database.
 
 - `groups`: Telegram chat ID; paused/monitoring; consent time; expiring deletion token.
 - `messages`: group ID, Telegram message ID, sender ID/name, text, timestamp, reply ID,
@@ -110,7 +116,7 @@ Optional: OPENAI_MODEL (gpt-5.6-luna), ARCADE_BASE_URL (https://platform.arcade.
 LORE_WINDOW_SIZE (100), VOTE_DURATION_SECONDS (120), ARCADE_POLL_SECONDS (5),
 ARCADE_JOB_TIMEOUT_SECONDS (600). Blank optional values use defaults.
 TEST_DATABASE_URL is test-only and enables the full PostgreSQL suite.
-Docker additionally uses POSTGRES_USER and POSTGRES_DB (both default to core),
+Optional local Docker additionally uses POSTGRES_USER and POSTGRES_DB (both default to core),
 and requires POSTGRES_PASSWORD. The local .env connection URL was updated to
 match; credentials remain private. Initialization settings only apply to empty storage.
 
@@ -123,7 +129,7 @@ match; credentials remain private. Initialization settings only apply to empty s
 - Vote-gated generation, idempotent requests, saved jobs, retries/restart recovery.
 - Real-price/image retrieval, result posts and private per-buyer checkouts.
 - Pause/removal controls, confirmed cascading deletion and sanitized error logs.
-- Full suite: 33 tests passed using isolated schemas in Docker PostgreSQL, including in-flight
+- Full suite: 36 tests passed using isolated schemas in Docker PostgreSQL, including in-flight
   pause cancellation, admin consent, cross-group callbacks and private checkout access.
 - Dependency consistency, syntax compilation, function docstrings and secret-pattern
   checks passed. Local configuration stays in the gitignored .env.
@@ -151,6 +157,10 @@ match; credentials remain private. Initialization settings only apply to empty s
   validation prevents stale vote buttons affecting a different active vote.
 - Repeated category ties mean more runoffs, never an invented winner.
 - Reliable Telegram membership checks need the bot to be a group administrator.
+- Product selection adds a second structured OpenAI request after meaningful lore is found.
+  Selection failures preserve the lore for `/retry`; there is no fixed-category fallback.
+  Catalog results may be up to one hour old. Live recommendation quality is not verified
+  by the mocked tests; the supported catalog IDs are always checked in application code.
 - Checkout may add shipping, drop-ship fees and tax to the displayed unit price.
 
 LORE_WINDOW_SIZE now sets the maximum context size per mention, not a trigger threshold.

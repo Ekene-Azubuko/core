@@ -19,6 +19,23 @@ pip install -r requirements.txt
 cp env.example .env
 ```
 
+The current database is hosted on Supabase; Docker is not needed to run the bot.
+In Supabase's **Connect** panel, copy the **Session pooler** PostgreSQL URL (port
+5432), substitute your URL-encoded database password, and set `DATABASE_URL` in
+`.env`. Use the username and host provided by Supabase. Append `?ssl=require` to
+require TLS (or `&ssl=require` if the URL already has query parameters).
+
+Use session pooling or a direct connection, not transaction pooling: Core uses a
+session advisory lock. No Supabase SDK or anon/service-role API key is needed.
+Keep the Data API disabled for bot-only data. Core creates its seven tables on
+startup. The switch uses fresh tables; no local data is migrated.
+
+Run `.venv/bin/python -m app.main` to use the configured database. Restart an
+already-running bot after changing `.env`. Groups need `/resume` again with a
+fresh database because prior consent and history were not copied.
+
+### Optional local database
+
 For local storage, start Docker Desktop and set `POSTGRES_USER=core`,
 `POSTGRES_DB=core` and your chosen `POSTGRES_PASSWORD` in `.env`. Set
 `DATABASE_URL=postgresql+asyncpg://core:YOUR_PASSWORD@127.0.0.1:5433/core`
@@ -114,8 +131,12 @@ not Telegram history or provider-side data/products, and leaves monitoring off.
 3. OpenAI Responses structured output supplies grounded lore or null. Evidence IDs
    must be in the window. The latest 20 proposals discourage repetitive suggestions.
    A no-lore window is consumed; failed analysis stays saved for `/retry`.
-4. Arcade `categories/list` supplies real categories. Core chooses at most three
-   distinct category groups, preferring print and sorting names alphabetically.
+4. Core preloads every supported category from Arcade `categories/list` at startup,
+   with an in-memory cache refreshed on use after one hour. GPT uses the detected lore
+   and latest saved mention message to choose one to three actual categories, best
+   match first. Explicit product requests take priority; a clear match can produce
+   one option plus No. It considers print and jewelry without alphabetical defaults.
+   Unknown or duplicate IDs are rejected. A failed preload is retried on analysis.
 5. Inline votes allow one changeable vote per member per round. Highest count wins
    (plurality, as specified). No wins ties; zero votes expire. A category tie runs
    another round with the tied categories and No. Old votes/buttons cannot affect it.
@@ -143,7 +164,7 @@ checkout. The actual product selection is shown; user-chosen variants are not im
 | `app/bot/handlers.py` | Consent, controls, ingestion, callbacks, private checkout |
 | `app/bot/keyboards.py` | Voting, retry and purchase buttons |
 | `app/services/pipeline.py` | Windows, durable workflow, worker and recovery |
-| `app/services/lore.py` | OpenAI schema, prompt and evidence validation |
+| `app/services/lore.py` | OpenAI lore extraction, evidence validation and catalog-based product selection |
 | `app/services/arcade.py` | Arcade HTTP API, categories, jobs, prices and checkout |
 | `app/services/voting.py` | Vote upserts, counting and runoffs |
 | `app/db/models.py` | Seven SQLAlchemy models and cascading deletion |

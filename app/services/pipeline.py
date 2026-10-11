@@ -12,7 +12,7 @@ from telegram.error import BadRequest, Forbidden, TelegramError
 from app.bot.keyboards import buy_keyboard, retry_keyboard, voting_keyboard
 from app.db.models import AnalysisWindow, GeneratedProduct, Group, LoreProposal, Message, WindowMessage, new_id, now
 from app.services.arcade import JobFailed
-from app.services.lore import extract_lore
+from app.services.lore import extract_lore, select_categories
 from app.services.voting import close_vote
 
 log = logging.getLogger(__name__)
@@ -71,6 +71,11 @@ class Pipeline:
 
     async def start(self):
         """Start scanning persisted work, including unfinished work after a restart."""
+        try:
+            catalog = await self.arcade.categories()
+            log.info("Loaded %s Arcade product categories.", len(catalog))
+        except Exception as error:
+            log.warning("Arcade catalog preload failed (%s); will retry on analysis.", type(error).__name__)
         self.worker = asyncio.create_task(self.run())
 
     async def stop(self):
@@ -188,7 +193,11 @@ class Pipeline:
                     if lore is None:
                         window.status = "analyzed"
                         return
-            categories = await self.arcade.categories()
+            catalog = await self.arcade.categories()
+            categories = await select_categories(
+                self.openai, self.config.openai_model, lore,
+                messages[-1].text if messages else "", catalog,
+            )
             async with self.locks[chat_id], self.sessions.begin() as session:
                 window = await session.get(AnalysisWindow, window_id)
                 if window is None:
@@ -204,7 +213,7 @@ class Pipeline:
                     return
                 window.status, window.error = "failed", type(error).__name__
             await self.bot.send_message(chat_id,
-                "Lore analysis or category retrieval failed. Your window is saved. "
+                "Lore analysis or product selection failed. Your window is saved. "
                 "An admin can use /retry to try again.")
 
     async def advance_vote(self, proposal_id):

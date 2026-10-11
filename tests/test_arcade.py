@@ -47,6 +47,27 @@ class ArcadeContractTests(unittest.IsolatedAsyncioTestCase):
         for category in ("print-id", "jewelry-id"):
             await self.arcade.generate({"requestId": category, "prompt": "A suitable design", "categoryId": category})
 
+    async def test_full_catalog_is_cached(self):
+        """Keep all categories, including same-group variants, and preload only once."""
+        calls = []
+
+        def respond(request):
+            """Return more than three categories to catch the former truncation."""
+            calls.append(request)
+            return httpx.Response(200, json={"items": [
+                {"categoryId": str(index), "name": f"Item {index}", "world": "print",
+                 "category": {"categoryId": "shared", "name": "Shared group"}}
+                for index in range(6)
+            ]})
+
+        self.transport(respond)
+        self.assertEqual(len(await self.arcade.categories()), 6)
+        self.assertEqual(len(await self.arcade.categories()), 6)
+        self.assertEqual(len(calls), 1)
+        self.arcade.catalog_loaded_at -= 3601
+        await self.arcade.categories()
+        self.assertEqual(len(calls), 2)
+
     async def test_checkout_quantity_one_requires_drop_ship(self):
         """Use Arcade's supported checkout schema, including the single-item prerequisite."""
         def respond(request):

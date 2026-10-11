@@ -72,7 +72,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             edit_message_reply_markup=AsyncMock(), get_chat_member=AsyncMock(
                 return_value=SimpleNamespace(status="administrator")))
         self.openai = SimpleNamespace(responses=SimpleNamespace(parse=AsyncMock(
-            return_value=SimpleNamespace(output_parsed=LoreResult(lore=Lore(**LORE))))))
+            return_value=SimpleNamespace(output_parsed=SimpleNamespace(lore=Lore(**LORE), category_ids=[item["categoryId"] for item in CATEGORIES])))))
         self.arcade = SimpleNamespace(
             categories=AsyncMock(return_value=CATEGORIES),
             generate=AsyncMock(return_value={"jobId": "test-job"}),

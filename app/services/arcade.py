@@ -2,6 +2,7 @@
 
 import asyncio
 from decimal import Decimal
+from time import monotonic
 
 import httpx
 
@@ -13,6 +14,9 @@ class JobFailed(Exception):
 class Arcade:
     def __init__(self, config):
         """Configure a single authenticated HTTP client with a bounded timeout."""
+        self.catalog = []
+        self.catalog_loaded_at = 0
+        self.catalog_lock = asyncio.Lock()
         self.client = httpx.AsyncClient(
             base_url=config.arcade_base_url.rstrip("/") + "/", timeout=45,
             headers={"Authorization": f"Bearer {config.arcade_key}",
@@ -41,21 +45,24 @@ class Arcade:
                 await asyncio.sleep(2 ** attempt)
 
     async def categories(self):
-        """Choose up to three real categories, preferring varied print products."""
-        result = await self.post("categories/list", {})
-        items = [item for item in result["items"] if item["world"] in ("print", "jewelry")]
-        items.sort(key=lambda item: (item["world"] != "print", item["name"]))
-        chosen, groups = [], set()
-        for item in items:
-            group = item.get("category", {}).get("categoryId", item["categoryId"])
-            if group not in groups:
-                chosen.append({key: item[key] for key in ("categoryId", "name", "world")})
-                groups.add(group)
-            if len(chosen) == 3:
-                break
-        if not chosen:
-            raise ValueError("Arcade returned no supported product categories")
-        return chosen
+        """Return the full supported catalog, refreshing the startup cache after one hour."""
+        async with self.catalog_lock:
+            if self.catalog and monotonic() - self.catalog_loaded_at < 3600:
+                return self.catalog
+            result = await self.post("categories/list", {})
+            catalog = []
+            for item in result["items"]:
+                if item["world"] not in ("print", "jewelry"):
+                    continue
+                category = {key: item[key] for key in ("categoryId", "name", "world")}
+                if item.get("category"):
+                    category["category"] = item["category"]
+                catalog.append(category)
+            if not catalog:
+                raise ValueError("Arcade returned no supported product categories")
+            self.catalog = catalog
+            self.catalog_loaded_at = monotonic()
+            return self.catalog
 
     async def generate(self, request):
         """Start the documented combined pattern-and-product workflow for either world."""
